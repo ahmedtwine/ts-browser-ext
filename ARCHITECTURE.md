@@ -523,3 +523,519 @@ ts-browser-ext/
 │   ├── icon.png / *.png     #   (same icons)
 └── chrome.txt               # Dev notes: example native host registration
 ```
+
+---
+
+## Appendix: Architecture Comparison — Native Messaging vs WebAssembly
+
+This section compares the approach used by this project (Tailscale, native messaging)
+with an alternative approach used by [Iroh](https://github.com/n0-computer/iroh-examples/tree/main/browser-echo)
+(compiling networking code to WebAssembly and running it entirely inside the browser).
+
+### Side-by-Side: Where Does the Networking Code Run?
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║              APPROACH A: NATIVE MESSAGING (this project)                     ║
+║                                                                              ║
+║  ┌─ Browser Sandbox ─────────────────────────┐                               ║
+║  │                                           │                               ║
+║  │  background.js          popup.js          │                               ║
+║  │  ┌───────────────┐     ┌─────────────┐    │                               ║
+║  │  │ Proxy config  │     │ Toggle UI   │    │                               ║
+║  │  │ Status relay  │     │ Status text │    │                               ║
+║  │  └───────┬───────┘     └─────────────┘    │                               ║
+║  │          │                                │                               ║
+║  │          │  No networking logic here.      │                               ║
+║  │          │  JS is just a remote control.   │                               ║
+║  │          │                                │                               ║
+║  │          │ chrome.runtime.connectNative() │                               ║
+║  └──────────┼────────────────────────────────┘                               ║
+║             │  stdin/stdout pipe                                              ║
+║             │  (length-prefixed JSON)                                         ║
+║  ┌──────────▼────────────────────────────────┐                               ║
+║  │                                           │                               ║
+║  │  ts-browser-ext (Go binary)               │                               ║
+║  │  RUNS ON THE OS, OUTSIDE THE SANDBOX      │                               ║
+║  │                                           │                               ║
+║  │  • tsnet.Server (full Tailscale node)     │                               ║
+║  │  • WireGuard tunnel (raw UDP)             │                               ║
+║  │  • TCP listener on 127.0.0.1              │                               ║
+║  │  • HTTP + SOCKS5 proxy server             │                               ║
+║  │  • Filesystem access (state storage)      │                               ║
+║  │  • Full OS networking privileges          │                               ║
+║  │                                           │                               ║
+║  └───────────────────────────────────────────┘                               ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║              APPROACH B: WEBASSEMBLY (Iroh browser-echo)                     ║
+║                                                                              ║
+║  ┌─ Browser Sandbox ─────────────────────────────────────────────────────┐   ║
+║  │                                                                       │   ║
+║  │  main.js (UI + glue)                                                  │   ║
+║  │  ┌──────────────────┐                                                 │   ║
+║  │  │ Form handling    │                                                 │   ║
+║  │  │ Event display    │                                                 │   ║
+║  │  │ DOM updates      │                                                 │   ║
+║  │  └────────┬─────────┘                                                 │   ║
+║  │           │  JS calls into WASM                                       │   ║
+║  │           ▼                                                           │   ║
+║  │  ┌─────────────────────────────────────────────────────────────────┐  │   ║
+║  │  │                                                                 │  │   ║
+║  │  │  browser-echo.wasm (Rust compiled to WebAssembly)               │  │   ║
+║  │  │  ALL NETWORKING LOGIC RUNS HERE, INSIDE THE BROWSER             │  │   ║
+║  │  │                                                                 │  │   ║
+║  │  │  ┌────────────┐  ┌────────────────┐  ┌──────────────────────┐  │  │   ║
+║  │  │  │ EchoNode   │  │ iroh::Endpoint │  │ Protocol handler    │  │  │   ║
+║  │  │  │ (app logic)│─►│ (QUIC over     │─►│ (echo: read→write)  │  │  │   ║
+║  │  │  │            │  │  WebTransport) │  │                     │  │  │   ║
+║  │  │  └────────────┘  └────────────────┘  └──────────────────────┘  │  │   ║
+║  │  │                                                                 │  │   ║
+║  │  │  Returns Web Streams API ReadableStream to JS                   │  │   ║
+║  │  └─────────────────────────────┬───────────────────────────────────┘  │   ║
+║  │                                │                                      │   ║
+║  │                                │  Browser-native networking only      │   ║
+║  │                                │  (WebTransport / WebSocket / fetch)  │   ║
+║  └────────────────────────────────┼──────────────────────────────────────┘   ║
+║                                   │                                          ║
+║               NO NATIVE PROCESS. NOTHING OUTSIDE THE SANDBOX.                ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+### How Each Approach Handles the Browser Sandbox
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    THE BROWSER SANDBOX PROBLEM                               │
+│                                                                              │
+│  Browser JS/WASM CANNOT:              Both projects need to:                 │
+│  ├─ Open raw UDP sockets              ├─ Establish encrypted P2P tunnels     │
+│  ├─ Open raw TCP listeners            ├─ Route traffic through those tunnels │
+│  ├─ Intercept DNS queries             ├─ Resolve custom hostnames            │
+│  ├─ Access the filesystem             └─ Persist cryptographic identity      │
+│  └─ Spawn OS processes                                                       │
+│                                                                              │
+│                     How each project escapes these constraints:               │
+│                                                                              │
+│  ┌─ Tailscale ─────────────────────┐  ┌─ Iroh ──────────────────────────┐   │
+│  │                                 │  │                                  │   │
+│  │  ESCAPE THE SANDBOX             │  │  STAY INSIDE THE SANDBOX         │   │
+│  │                                 │  │                                  │   │
+│  │  Use Native Messaging to run    │  │  Redesign the protocol to only   │   │
+│  │  a full OS process that has     │  │  use APIs the browser provides:  │   │
+│  │  no restrictions.               │  │                                  │   │
+│  │                                 │  │  Raw UDP ──► WebTransport (QUIC) │   │
+│  │  Raw UDP? ──► Go binary can.    │  │  TCP listen ──► not needed       │   │
+│  │  TCP listen? ──► Go binary can. │  │  DNS ──► connect by node ID      │   │
+│  │  DNS? ──► Go binary can.        │  │  Filesystem ──► IndexedDB        │   │
+│  │  Filesystem? ──► Go binary can. │  │                                  │   │
+│  │                                 │  │  Trade-off: can only tunnel       │   │
+│  │  Trade-off: requires native     │  │  connections the WASM code       │   │
+│  │  binary install on the machine. │  │  explicitly opens. Cannot proxy  │   │
+│  │  Desktop-only.                  │  │  all browser traffic.            │   │
+│  │                                 │  │  Works everywhere, even mobile.  │   │
+│  └─────────────────────────────────┘  └──────────────────────────────────┘   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Traffic Flow Comparison
+
+```
+ TAILSCALE — every browser request gets tunneled:
+ ════════════════════════════════════════════════
+
+  Browser tab                                              Tailnet peer
+  types URL ──► chrome.proxy routes ──► 127.0.0.1:<port> ──► WireGuard ──► peer
+                ALL traffic to proxy     (Go process)        (raw UDP)
+
+  ┌────────┐    ┌──────────────┐    ┌───────────────────┐    ┌──────────────┐
+  │ Browser│───►│ Proxy Config │───►│ Go: HTTP/SOCKS5   │───►│  Peer node   │
+  │  tab   │    │ (extension   │    │   proxy server    │    │  on tailnet  │
+  │        │◄───│  configures) │◄───│   + WireGuard     │◄───│              │
+  └────────┘    └──────────────┘    └───────────────────┘    └──────────────┘
+                  in browser            on the OS               on the internet
+                  sandbox               (unsandboxed)
+
+
+
+ IROH — only explicit app connections get tunneled:
+ ══════════════════════════════════════════════════
+
+  WASM module                                              Remote peer
+  calls connect() ──► iroh::Endpoint ──► WebTransport ──► relay/direct ──► peer
+
+  ┌────────────────────────────────────────────────┐    ┌──────────────┐
+  │ Browser                                        │    │              │
+  │                                                │    │  Remote      │
+  │  ┌─────────┐    ┌───────────────────────────┐  │    │  peer        │
+  │  │ main.js │───►│ WASM: iroh::Endpoint      │──┼───►│  (also       │
+  │  │  (UI)   │◄───│  connect(node_id, payload)│◄─┼────│   running    │
+  │  └─────────┘    └───────────────────────────┘  │    │   iroh)      │
+  │                                                │    │              │
+  │  Normal browser requests (google.com etc)      │    └──────────────┘
+  │  go directly to the internet, NOT tunneled.    │
+  │                                                │
+  └────────────────────────────────────────────────┘
+     everything inside the browser sandbox
+```
+
+### Capability Comparison
+
+```
+┌──────────────────────┬─────────────────────────────┬────────────────────────────────┐
+│                      │  TAILSCALE                   │  IROH                          │
+│                      │  (Native Messaging + Go)     │  (Rust → WebAssembly)          │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Code runs            │ OS process (outside sandbox)│ Inside browser (WASM sandbox) │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Transport            │ WireGuard (raw UDP)          │ QUIC over WebTransport         │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Proxies ALL browser  │ YES — chrome.proxy routes   │ NO — only app-level            │
+│ traffic?             │ every request through it     │ connections opened by WASM     │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Custom DNS?          │ YES — MagicDNS via tsnet    │ NO — browser-native DNS only   │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Installation         │ TWO steps: extension +       │ ONE step: open a webpage       │
+│                      │ native binary on machine     │ (WASM loads automatically)     │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Sandbox escape?      │ YES — native process has     │ NO — fully sandboxed           │
+│                      │ full OS privileges           │                                │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Raw sockets?         │ YES (Go binary)              │ NO (WebTransport/WS/fetch)     │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ State persistence    │ Filesystem                   │ Browser storage (IndexedDB)    │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Mobile browsers?     │ NO — native messaging        │ YES — any browser with         │
+│                      │ unavailable on mobile         │ WASM + WebTransport            │
+├──────────────────────┼─────────────────────────────┼────────────────────────────────┤
+│ Security surface     │ Larger — native binary has   │ Smaller — constrained to       │
+│                      │ full OS access               │ browser sandbox                │
+└──────────────────────┴─────────────────────────────┴────────────────────────────────┘
+```
+
+### Why Tailscale Cannot Use the WASM Approach
+
+```
+  Tailscale requires:                       Why WASM can't provide it:
+  ───────────────────                       ─────────────────────────
+
+  WireGuard (raw UDP sockets)         ───►  Browser has no raw UDP API.
+                                            WebTransport uses QUIC, which is a
+                                            different protocol. You can't run
+                                            WireGuard over WebTransport.
+
+  Route ALL browser traffic           ───►  WASM can only open connections that
+  through the VPN tunnel                    it initiates itself. It cannot
+                                            intercept requests from the URL bar,
+                                            other tabs, or other extensions.
+                                            The chrome.proxy API requires a real
+                                            TCP server to proxy to.
+
+  MagicDNS (*.ts.net resolution)      ───►  WASM cannot intercept or override
+                                            the browser's DNS resolution.
+                                            Iroh sidesteps this entirely by
+                                            connecting via node IDs, not hostnames.
+
+  Persistent node identity stored     ───►  WASM has no filesystem access.
+  on the filesystem                         Could use IndexedDB, but tsnet
+                                            expects a real directory path.
+
+  Iroh was designed around browser constraints from day one (QUIC/WebTransport).
+  Tailscale's protocol predates browser support and is built on WireGuard,
+  which fundamentally requires raw UDP — impossible inside a browser sandbox.
+```
+
+### Can Extensions Use WASM? (Yes, But It Doesn't Help)
+
+A natural question: could you skip the native binary and put the WASM networking
+code inside a browser extension instead of a webpage? Extensions **can** load WASM,
+but WASM inside an extension has the same sandbox restrictions as WASM in a webpage.
+It does not grant any new networking capabilities.
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│              WASM Inside an Extension — What It Can and Cannot Do          │
+│                                                                           │
+│  ┌─ Extension with WASM ──────────────────────────────────────────────┐   │
+│  │                                                                    │   │
+│  │  background.js (service worker)                                    │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │  const wasm = await WebAssembly.instantiateStreaming(       │   │   │
+│  │  │    fetch(chrome.runtime.getURL("iroh.wasm"))               │   │   │
+│  │  │  );                                                        │   │   │
+│  │  │                                                            │   │   │
+│  │  │  iroh.wasm runs here ──► STILL INSIDE THE SANDBOX          │   │   │
+│  │  │                                                            │   │   │
+│  │  │  CAN:                          CANNOT:                     │   │   │
+│  │  │  • Run Rust/C/Go code fast     • Open raw UDP/TCP sockets  │   │   │
+│  │  │  • Do crypto, computation      • Listen on ports           │   │   │
+│  │  │  • Call browser APIs via JS    • Access the filesystem     │   │   │
+│  │  │  • Use WebTransport            • Bypass browser networking │   │   │
+│  │  │  • Use fetch() / WebSocket     • Intercept DNS             │   │   │
+│  │  │                                • Do anything JS can't do   │   │   │
+│  │  │                                                            │   │   │
+│  │  │  WASM is a COMPUTE sandbox. It lets you run native code    │   │   │
+│  │  │  fast, but it does NOT escalate network privileges.        │   │   │
+│  │  │  It has EXACTLY the same network access as JavaScript.     │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                    │   │
+│  │  The extension platform adds:                                      │   │
+│  │  • chrome.proxy API (route traffic through a proxy server)         │   │
+│  │  • chrome.webRequest (observe/modify HTTP requests)                │   │
+│  │  • Persistent background execution (service worker)                │   │
+│  │  • chrome.storage (persistent key-value storage)                   │   │
+│  │  • But still NO raw sockets, NO TCP port listeners                │   │
+│  │                                                                    │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Extension + WASM vs Webpage + WASM vs Extension + Native
+
+```
+┌──────────────────────┬─────────────────────┬─────────────────────┬─────────────────────┐
+│                      │ Iroh in a           │ Iroh in an          │ Tailscale            │
+│                      │ WEBPAGE (WASM)      │ EXTENSION (WASM)    │ EXTENSION (native)   │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Connect to specific  │ YES                 │ YES                 │ YES                  │
+│ peers                │                     │                     │                      │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Tunnel app-level     │ YES                 │ YES                 │ YES                  │
+│ traffic              │                     │                     │                      │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Proxy ALL browser    │ NO                  │ NO                  │ YES                  │
+│ traffic              │                     │                     │                      │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Persistent           │ NO — dies when      │ YES — service       │ YES — native process │
+│ background           │ tab closes          │ worker persists     │ persists             │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Native binary        │ NO                  │ NO                  │ YES — must install   │
+│ required?            │                     │                     │                      │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Raw sockets?         │ NO                  │ NO                  │ YES                  │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Custom DNS?          │ NO                  │ NO                  │ YES                  │
+├──────────────────────┼─────────────────────┼─────────────────────┼──────────────────────┤
+│ Mobile browsers?     │ YES                 │ limited (Firefox    │ NO                   │
+│                      │                     │ Android only)       │                      │
+└──────────────────────┴─────────────────────┴─────────────────────┴──────────────────────┘
+
+  The middle column (extension + WASM) gains persistent background execution
+  over the webpage approach, but gains NOTHING in terms of network capabilities.
+  It still cannot proxy all browser traffic.
+```
+
+#### When Extension + WASM DOES Make Sense
+
+```
+  If you DON'T need to proxy all browser traffic and just want a
+  persistent P2P node running in the background:
+
+  ┌─ Hypothetical Iroh Extension (WASM, no native binary) ────────────┐
+  │                                                                    │
+  │  background.js (service worker)                                    │
+  │  ┌──────────────────────────────────────────────────────────────┐  │
+  │  │  iroh.wasm                                                   │  │
+  │  │                                                              │  │
+  │  │  • Persistent Iroh node running in the background            │  │
+  │  │  • Connects to peers via WebTransport (QUIC)                 │  │
+  │  │  • Syncs files, messages, or data between peers              │  │
+  │  │  • Receives incoming connections from other Iroh nodes       │  │
+  │  │  • Stores state in IndexedDB                                 │  │
+  │  └──────────────────────────────────────────────────────────────┘  │
+  │                                                                    │
+  │  popup.js                                                          │
+  │  ┌──────────────────────────────────────────────────────────────┐  │
+  │  │  • Shows sync status, connected peers, transfer progress     │  │
+  │  │  • No proxy configuration, no traffic interception           │  │
+  │  │  • Just a P2P application that lives in the extension bar    │  │
+  │  └──────────────────────────────────────────────────────────────┘  │
+  │                                                                    │
+  │  This works perfectly. Zero native install.                        │
+  │  But it's a P2P app, not a VPN for all browser traffic.           │
+  │                                                                    │
+  └────────────────────────────────────────────────────────────────────┘
+
+  Use cases where this is the right choice:
+  • P2P file sharing extension
+  • Decentralized messaging
+  • Collaborative editing (CRDT sync)
+  • Browser-to-browser data transfer
+
+  Use cases where you MUST use native messaging instead:
+  • VPN / tunnel all browser traffic        (needs TCP listener + chrome.proxy)
+  • Custom DNS resolution                   (needs raw socket access)
+  • WireGuard-based networking              (needs raw UDP)
+  • System-level proxy                      (needs OS networking)
+```
+
+
+---
+
+## Appendix B: Browser-Only Agent Architecture (OpenClaw-in-Extension)
+
+What if you wanted to build an autonomous agent system (like OpenClaw) that
+lives **entirely inside a browser extension** — no native host, no server?
+
+### Diagram 1: The Best Possible Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BROWSER EXTENSION (MV3)                             │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                     SERVICE WORKER (background.js)                    │  │
+│  │                                                                       │  │
+│  │  Lifecycle: event-driven, killed after ~5 min idle                    │  │
+│  │  Woken by: chrome.alarms, Web Push, chrome.runtime messages           │  │
+│  │                                                                       │  │
+│  │  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │  │
+│  │  │  Agent Engine    │  │  Tool Executor    │  │  Task Scheduler     │  │  │
+│  │  │                 │  │                  │  │                     │  │  │
+│  │  │  • LLM calls    │  │  • fetch() to    │  │  • chrome.alarms    │  │  │
+│  │  │    via fetch()  │  │    external APIs  │  │    (min 1 min)     │  │  │
+│  │  │  • Plan/decide  │  │  • DOM injection  │  │  • Queues tasks in  │  │  │
+│  │  │  • Orchestrate  │  │    via content    │  │    IndexedDB        │  │  │
+│  │  │    multi-step   │  │    scripts        │  │  • Resumes after    │  │  │
+│  │  │    workflows    │  │  • Tab control    │  │    worker restart   │  │  │
+│  │  └────────┬────────┘  └────────┬─────────┘  └──────────┬──────────┘  │  │
+│  │           │                    │                        │             │  │
+│  │  ┌────────┴────────────────────┴────────────────────────┴──────────┐  │  │
+│  │  │                    PERSISTENT STORAGE LAYER                      │  │  │
+│  │  │                                                                  │  │  │
+│  │  │  IndexedDB          OPFS                   chrome.storage.local  │  │  │
+│  │  │  ┌──────────────┐   ┌──────────────────┐   ┌────────────────┐   │  │  │
+│  │  │  │ Structured   │   │ File-like storage │   │ Key-value      │   │  │  │
+│  │  │  │ data, queues,│   │ for large blobs,  │   │ for settings,  │   │  │  │
+│  │  │  │ agent memory,│   │ conversation logs,│   │ state flags,   │   │  │  │
+│  │  │  │ tool results │   │ WASM modules      │   │ sync across    │   │  │  │
+│  │  │  │              │   │                   │   │ devices         │   │  │  │
+│  │  │  │ (unlimited)  │   │ (unlimited)       │   │ (10 MB cap)    │   │  │  │
+│  │  │  └──────────────┘   └──────────────────┘   └────────────────┘   │  │  │
+│  │  │  ↑ All survive worker kills. State rehydrated on every wake.    │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                       CONTENT SCRIPTS                                 │  │
+│  │                                                                       │  │
+│  │  Injected into web pages on demand                                    │  │
+│  │  • Read/modify DOM  • Extract page data  • Fill forms  • Click       │  │
+│  │  • Communicate with service worker via chrome.runtime.sendMessage     │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                       POPUP / SIDE PANEL UI                           │  │
+│  │                                                                       │  │
+│  │  • Dashboard showing agent status, task queue, logs                    │  │
+│  │  • Manual trigger for tasks                                           │  │
+│  │  • Settings (API keys, schedules)                                     │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+              ┌────────────────┼────────────────────┐
+              │                │                    │
+              ▼                ▼                    ▼
+   ┌──────────────────┐ ┌──────────────┐  ┌────────────────────┐
+   │   LLM API        │ │ External APIs│  │  Push Relay        │
+   │   (Claude, etc.) │ │ (GitHub,     │  │  (thin server)     │
+   │                  │ │  Slack, etc.)│  │                    │
+   │   fetch() ────►  │ │  fetch() ──► │  │  Webhook ──► Push  │
+   │   ◄──── JSON     │ │  ◄── JSON    │  │  (translates       │
+   └──────────────────┘ └──────────────┘  │  webhooks into      │
+                                          │  Web Push messages  │
+                                          │  that wake the      │
+                                          │  service worker)    │
+                                          └────────────────────┘
+
+  INBOUND EVENT FLOW (how the outside world reaches the extension):
+
+  External Event (e.g. GitHub webhook, new email)
+       │
+       ▼
+  Push Relay Server (Cloudflare Worker / tiny VPS)
+       │  Receives webhook, encrypts with VAPID,
+       │  forwards to FCM (Chrome) or Mozilla Push (Firefox)
+       ▼
+  Browser Push Service (FCM / Mozilla)
+       │
+       ▼
+  Service Worker wakes via 'push' event
+       │  Reads payload, stores in IndexedDB,
+       │  triggers agent logic
+       ▼
+  Agent processes event
+```
+
+### Diagram 2: Hard Limits — What This Architecture CANNOT Do
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      IMPOSSIBLE IN A BROWSER EXTENSION                      │
+│                                                                             │
+│  ╔═══════════════════════════════════════════════════════════════════════╗   │
+│  ║  NO INBOUND CONNECTIONS                                             ║   │
+│  ║                                                                     ║   │
+│  ║  Cannot listen on a TCP/UDP port. No ServerSocket API exists.       ║   │
+│  ║  Cannot accept incoming HTTP requests.                              ║   │
+│  ║  Cannot run a web server, API server, or tunnel endpoint.           ║   │
+│  ║                                                                     ║   │
+│  ║  Workaround: Push Relay (see above) or polling via chrome.alarms    ║   │
+│  ╚═══════════════════════════════════════════════════════════════════════╝   │
+│                                                                             │
+│  ╔═══════════════════════════════════════════════════════════════════════╗   │
+│  ║  NO RAW SOCKETS                                                     ║   │
+│  ║                                                                     ║   │
+│  ║  No TCP, UDP, or ICMP sockets. Only fetch() and WebSocket.          ║   │
+│  ║  Cannot implement WireGuard, custom DNS, or any wire protocol.      ║   │
+│  ║  Cannot proxy traffic at the network level (no chrome.proxy target).║   │
+│  ║                                                                     ║   │
+│  ║  Workaround: None — requires native host for raw networking         ║   │
+│  ╚═══════════════════════════════════════════════════════════════════════╝   │
+│                                                                             │
+│  ╔═══════════════════════════════════════════════════════════════════════╗   │
+│  ║  NO PERSISTENT EXECUTION                                            ║   │
+│  ║                                                                     ║   │
+│  ║  Service worker killed after ~5 min idle (30 sec hard limit per     ║   │
+│  ║  event in some browsers). Cannot run continuous background loops.   ║   │
+│  ║  All in-memory state lost on kill. No cron-like sub-second timers.  ║   │
+│  ║                                                                     ║   │
+│  ║  Workaround: chrome.alarms (1 min minimum), Web Push to wake,      ║   │
+│  ║  persist all state to IndexedDB/OPFS between events                 ║   │
+│  ╚═══════════════════════════════════════════════════════════════════════╝   │
+│                                                                             │
+│  ╔═══════════════════════════════════════════════════════════════════════╗   │
+│  ║  NO FILESYSTEM / OS ACCESS                                          ║   │
+│  ║                                                                     ║   │
+│  ║  Cannot read/write real files. No child processes. No OS APIs.      ║   │
+│  ║  Cannot run shell commands, access clipboard persistently, or       ║   │
+│  ║  interact with other desktop applications.                          ║   │
+│  ║                                                                     ║   │
+│  ║  Workaround: OPFS for virtual files; native messaging for OS       ║   │
+│  ║  access (but then it's no longer "browser-only")                    ║   │
+│  ╚═══════════════════════════════════════════════════════════════════════╝   │
+│                                                                             │
+│  ╔═══════════════════════════════════════════════════════════════════════╗   │
+│  ║  NO CROSS-ORIGIN DOM ACCESS (without permission)                    ║   │
+│  ║                                                                     ║   │
+│  ║  Content scripts can only touch pages matching manifest patterns.   ║   │
+│  ║  Cannot read iframes from other origins. Cannot bypass CORS.        ║   │
+│  ║                                                                     ║   │
+│  ║  Workaround: Declare broad host_permissions in manifest; use        ║   │
+│  ║  fetch() from service worker (which bypasses CORS)                  ║   │
+│  ╚═══════════════════════════════════════════════════════════════════════╝   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  SUMMARY: A browser extension can be a capable outbound agent (call APIs,
+  scrape pages, automate tabs) with durable state (IndexedDB, OPFS) and
+  wake-on-push (Web Push API). It CANNOT be a server, a tunnel, or a
+  continuously running daemon.
+```
