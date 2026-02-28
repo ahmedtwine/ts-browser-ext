@@ -1039,3 +1039,321 @@ lives **entirely inside a browser extension** — no native host, no server?
   wake-on-push (Web Push API). It CANNOT be a server, a tunnel, or a
   continuously running daemon.
 ```
+
+---
+
+## Appendix C: WASM-Sandboxed Agent Runtime — The Agent App Store
+
+### The Problem: Running Third-Party Agents Is All-or-Nothing
+
+Today, running someone else's AI agent means trusting it with everything:
+
+```
+  CURRENT STATE: Installing a third-party agent
+
+  npm install cool-agent        pip install cool-agent
+       │                              │
+       ▼                              ▼
+  Runs with YOUR:                Runs with YOUR:
+  • Shell (can exec anything)    • Shell
+  • Filesystem (all of it)       • Filesystem
+  • Env vars (API keys, tokens)  • Env vars
+  • SSH keys                     • SSH keys
+  • Browser cookies              • Network access
+  • Network access               • Everything
+
+  ONE malicious tool call = exfiltrated credentials.
+  There is no sandbox. You are trusting the developer
+  with your entire machine.
+
+  This is pre-iPhone app security. Every app had root.
+```
+
+### The Solution: WASM as the Sandbox Enforcement Layer
+
+WebAssembly provides a **hardware-enforced** sandbox. A `.wasm` binary:
+- Cannot access the filesystem unless the host provides a FS tool
+- Cannot make network calls unless the host provides a fetch tool
+- Cannot read environment variables, ever
+- Cannot escape its linear memory sandbox
+
+This means you can run **untrusted agent code safely**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      AGENT APP STORE MODEL                              │
+│                                                                         │
+│  Agent Marketplace                                                      │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐                │
+│  │ Expense      │  │ Code Review  │  │ Email Triage    │                │
+│  │ Processor    │  │ Agent        │  │ Agent           │                │
+│  │              │  │              │  │                 │                │
+│  │ .wasm        │  │ .wasm        │  │ .wasm           │                │
+│  │ by: @alice   │  │ by: @bob     │  │ by: @carol      │                │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬────────┘                │
+│         │                 │                    │                         │
+│         └─────────────────┼────────────────────┘                         │
+│                           │                                              │
+│                     user downloads                                       │
+│                           │                                              │
+│                           ▼                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                    HOST RUNTIME (your machine)                     │  │
+│  │                                                                    │  │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │  │
+│  │  │  WASM SANDBOX (per agent)                                    │  │  │
+│  │  │                                                              │  │  │
+│  │  │  Agent code runs here.                                       │  │  │
+│  │  │  CANNOT see outside this box.                                │  │  │
+│  │  │  Has zero capabilities by default.                           │  │  │
+│  │  └──────────────────────────┬───────────────────────────────────┘  │  │
+│  │                             │                                      │  │
+│  │           host-provided tools (user grants each one)               │  │
+│  │                             │                                      │  │
+│  │  ┌──────────────────────────▼───────────────────────────────────┐  │  │
+│  │  │  CAPABILITY GRANTS (like iOS permissions)                    │  │  │
+│  │  │                                                              │  │  │
+│  │  │  ✅ llm_call()    — host injects API key in auth header,    │  │  │
+│  │  │                     agent never sees the key                 │  │  │
+│  │  │  ✅ read_folder() — scoped to ONE folder user picked        │  │  │
+│  │  │  ✅ write_api()   — scoped to one specific API endpoint     │  │  │
+│  │  │                                                              │  │  │
+│  │  │  ❌ filesystem    — no blanket access                        │  │  │
+│  │  │  ❌ env vars      — never exposed                            │  │  │
+│  │  │  ❌ network       — only through granted tools               │  │  │
+│  │  │  ❌ child_process — cannot exec                              │  │  │
+│  │  │                                                              │  │  │
+│  │  │  These are NOT policy checks. These are WASM guarantees.     │  │  │
+│  │  │  The agent literally cannot call APIs that aren't injected.  │  │  │
+│  │  └──────────────────────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  HOST ENVIRONMENTS (same .wasm, different granted tools):               │
+│                                                                         │
+│  ┌────────────────────┐ ┌──────────────────┐ ┌──────────────────────┐   │
+│  │ Browser Extension  │ │ Desktop (wasmtime│ │ Mobile (React Native │   │
+│  │                    │ │  / native host)  │ │  WASM runtime)       │   │
+│  │ Grants:            │ │ Grants:          │ │ Grants:              │   │
+│  │ • chrome.tabs      │ │ • filesystem     │ │ • camera             │   │
+│  │ • content scripts  │ │ • shell (scoped) │ │ • contacts           │   │
+│  │ • fetch()          │ │ • git            │ │ • push notifications │   │
+│  │ • IndexedDB        │ │ • database       │ │ • location           │   │
+│  │ • Web Push         │ │ • Playwright     │ │ • on-device storage  │   │
+│  └────────────────────┘ └──────────────────┘ └──────────────────────┘   │
+│                                                                         │
+│  AGENT STATE: portable, serializable, env-agnostic                      │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  State blob (msgpack/JSON):                                      │   │
+│  │  • Task queue + progress                                         │   │
+│  │  • Conversation history                                          │   │
+│  │  • Learned heuristics / few-shot examples                        │   │
+│  │  • Extracted ASSETS (content, summaries — NOT file paths,        │   │
+│  │    NOT env-specific handles, NOT credentials)                    │   │
+│  │                                                                  │   │
+│  │  On env shift: agent retains assets, forgets env internals.      │   │
+│  │  Sync: P2P (WebRTC / Tailscale) or cloud relay                  │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  KEY COMPARISON:
+
+  Pre-iPhone Apps          iOS Apps              Today's AI Agents       WASM Agents
+  ──────────────           ────────              ─────────────────       ───────────
+  Full system access       Sandboxed             Full system access      Sandboxed
+  Trust the developer      Trust the sandbox     Trust the developer     Trust the sandbox
+  No permission model      Request permissions   No permission model     Capability grants
+  Install = full trust     Install = safe        Install = full trust    Install = safe
+```
+
+### Why This Requires WASM (Not Just Containers/Policies)
+
+```
+  ALTERNATIVE                     WHY IT DOESN'T WORK
+  ───────────────────             ─────────────────────────────────────
+
+  Docker container                Too heavy for browser/mobile.
+                                  30-second startup. Not embeddable.
+
+  OS-level sandboxing             Platform-specific. Can't run the
+  (seccomp, App Sandbox)          same agent binary on browser + mobile.
+
+  Policy-based restrictions       Bypassable. Agent code can find
+  (allowlists, deny rules)        creative ways around policies.
+                                  It's a cat-and-mouse game.
+
+  Code review / auditing          Doesn't scale. Can't review every
+                                  version of every agent from every
+                                  developer.
+
+  WASM sandbox                    ✅ Hardware-enforced memory isolation
+                                  ✅ Runs in browser, server, mobile
+                                  ✅ ~1ms startup
+                                  ✅ Same binary everywhere
+                                  ✅ Cannot be escaped (by design)
+                                  ✅ Capabilities injected by host
+```
+
+### Building This With Rig (Rust → WASM Agent Core)
+
+Rig (`rig-core`) has full WASM compatibility. An agent built with Rig
+compiles to a `.wasm` binary that contains:
+
+```
+  rig-core (wasm32-unknown-unknown)
+  ┌──────────────────────────────────────────────────┐
+  │                                                  │
+  │  Agent orchestration loop:                       │
+  │  • Prompt construction                           │
+  │  • Tool call parsing                             │
+  │  • Multi-turn conversation management            │
+  │  • Streaming response handling                   │
+  │                                                  │
+  │  Imports from host (NOT compiled in):            │
+  │  • llm_completion(prompt) → response             │
+  │  • tool_execute(name, args) → result             │
+  │  • state_load() → bytes                          │
+  │  • state_save(bytes)                             │
+  │  • log(message)                                  │
+  │                                                  │
+  │  The agent calls these imports.                  │
+  │  The host decides what they do.                  │
+  │  The agent cannot do anything else.              │
+  └──────────────────────────────────────────────────┘
+
+  In a browser extension:                In a desktop runtime:
+    llm_completion → fetch() to API        llm_completion → fetch() to API
+    tool_execute   → content scripts       tool_execute   → filesystem/shell
+    state_load     → IndexedDB.get()       state_load     → fs.readFile()
+    state_save     → IndexedDB.put()       state_save     → fs.writeFile()
+```
+
+### Use Case: Cross-Org Agent — The Digital Consultant
+
+A single agent moves between different organizations' environments to
+complete a workflow that spans trust boundaries. Each org runs the agent
+in their own sandbox, grants only their tools, and the agent carries
+filtered assets — never raw internals — between environments.
+
+```
+  HIRING PIPELINE: Company A needs to hire, Company B is a recruiting agency.
+
+  ┌─ STEP 1: Agent runs inside Company A's environment ──────────────────┐
+  │                                                                       │
+  │  Sandbox: Company A's WASM runtime (their infra, their rules)        │
+  │                                                                       │
+  │  Tools granted by Company A:                                          │
+  │    • read_job_descriptions()                                          │
+  │    • read_team_structure()                                            │
+  │    • read_salary_bands()          ◄── agent sees this internally      │
+  │    • read_hiring_manager_prefs()                                      │
+  │                                                                       │
+  │  Agent works:                                                         │
+  │    Reads everything. Understands the role deeply.                      │
+  │    Knows the salary is $180-220k. Knows the team is 4 people.        │
+  │    Knows the manager wants someone with distributed systems exp.      │
+  │                                                                       │
+  │  Asset extraction (what leaves this environment):                     │
+  │    ┌────────────────────────────────────────────────┐                  │
+  │    │  ASSET: role_requirements                      │                  │
+  │    │  {                                             │                  │
+  │    │    title: "Senior Rust Engineer",              │                  │
+  │    │    must_have: ["Rust", "distributed systems"], │                  │
+  │    │    nice_to_have: ["WASM", "networking"],       │                  │
+  │    │    level: "senior",                            │                  │
+  │    │    start: "Q3 2026"                            │                  │
+  │    │  }                                             │                  │
+  │    └────────────────────────────────────────────────┘                  │
+  │                                                                       │
+  │  FILTERED OUT (does NOT leave):                                       │
+  │    ✗ salary band ($180-220k)                                          │
+  │    ✗ internal team structure / org chart                               │
+  │    ✗ manager names / preferences                                      │
+  │    ✗ Company A's API endpoints, credentials, DB schemas               │
+  │                                                                       │
+  │  Company A controls the filter. The WASM sandbox guarantees           │
+  │  the agent can't smuggle data out — it can only export                │
+  │  through the host's asset_export() function, which Company A          │
+  │  defines and audits.                                                  │
+  └───────────────────────────────────────────────────────────────────────┘
+                               │
+                     agent.wasm + asset blob
+                     (agent binary is identical,
+                      only the asset travels)
+                               │
+                               ▼
+  ┌─ STEP 2: Agent runs inside Company B's environment ──────────────────┐
+  │                                                                       │
+  │  Sandbox: Company B's WASM runtime (their infra, their rules)        │
+  │                                                                       │
+  │  Agent arrives with:                                                  │
+  │    • The role_requirements asset (from Step 1)                        │
+  │    • Its own reasoning history                                        │
+  │    • NOTHING about Company A's internals                              │
+  │                                                                       │
+  │  Tools granted by Company B:                                          │
+  │    • search_candidates(skills, level)                                 │
+  │    • get_candidate_profile(id)                                        │
+  │    • get_availability(candidate_id)                                   │
+  │    • check_rate_card(level)        ◄── agent sees this internally     │
+  │                                                                       │
+  │  Agent works:                                                         │
+  │    Searches for "Senior Rust + distributed systems" candidates.       │
+  │    Finds 12 matches, narrows to 3 based on availability.              │
+  │    Knows Company B charges $45k per placement (from rate card).       │
+  │                                                                       │
+  │  Asset extraction (what leaves this environment):                     │
+  │    ┌────────────────────────────────────────────────┐                  │
+  │    │  ASSET: candidate_shortlist                    │                  │
+  │    │  [                                             │                  │
+  │    │    { name: "Alex K.", fit: "strong",           │                  │
+  │    │      available: "June 2026",                   │                  │
+  │    │      summary: "8yr Rust, built distributed    │                  │
+  │    │               cache at scale" },               │                  │
+  │    │    { name: "Sam T.", fit: "strong", ... },     │                  │
+  │    │    { name: "Jordan P.", fit: "moderate", ... } │                  │
+  │    │  ]                                             │                  │
+  │    └────────────────────────────────────────────────┘                  │
+  │                                                                       │
+  │  FILTERED OUT (does NOT leave):                                       │
+  │    ✗ Company B's rate card / pricing                                  │
+  │    ✗ Full candidate database / other candidates                       │
+  │    ✗ Company B's internal ranking algorithms                          │
+  │    ✗ Company B's API endpoints, credentials                           │
+  └───────────────────────────────────────────────────────────────────────┘
+                               │
+                     agent.wasm + accumulated assets
+                               │
+                               ▼
+  ┌─ STEP 3: Agent returns to Company A's environment ───────────────────┐
+  │                                                                       │
+  │  Agent arrives with:                                                  │
+  │    • role_requirements (from Step 1)                                  │
+  │    • candidate_shortlist (from Step 2)                                │
+  │    • NOTHING about Company B's pricing or full database               │
+  │                                                                       │
+  │  Tools granted by Company A:                                          │
+  │    • schedule_interview(candidate, hiring_manager, dates)             │
+  │    • send_notification(hiring_manager, message)                       │
+  │    • update_ats(job_id, candidates)     (applicant tracking system)   │
+  │                                                                       │
+  │  Agent works:                                                         │
+  │    Cross-references shortlist with manager preferences.               │
+  │    Schedules interviews for the top 2 candidates.                     │
+  │    Updates the ATS. Notifies the hiring manager.                      │
+  │    Done.                                                              │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  WHY THIS CAN'T EXIST WITHOUT WASM SANDBOXING:
+
+  • Company A won't run Company B's code on their infra (untrusted)
+  • Company B won't expose their candidate DB to Company A's agent
+  • Both need guarantees that data doesn't leak beyond declared assets
+  • WASM sandbox = each company controls exactly what the agent sees
+    and exactly what it can export. Not policy. Not trust. Enforcement.
+
+  This is how human consultants already work — they see confidential
+  info at each client, carry expertise and deliverables between them,
+  but don't leak internals. WASM makes this possible for AI agents.
+```
